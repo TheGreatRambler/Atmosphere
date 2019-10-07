@@ -30,6 +30,7 @@ typedef struct IrqManager {
     u8 numPriorityLevels;
     u8 numCpuInterfaces;
     u8 numSharedInterrupts;
+    u8 numListRegisters;
     // Note: we don't store interrupt handlers since we will handle some SGI + uart interrupt(s)...
 } IrqManager;
 

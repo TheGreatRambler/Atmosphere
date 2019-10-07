@@ -38,6 +38,7 @@ static void initGic(void)
         g_irqManager.numPriorityLevels = (u8)BIT(__builtin_popcount(g_irqManager.gic.gicd->ipriorityr[0]));
 
         g_irqManager.numCpuInterfaces = (u8)(1 + ((g_irqManager.gic.gicd->typer >> 5) & 7));
+        g_irqManager.numListRegisters = (u8)(1 + g_irqManager.gic.gich->vtr & 0x3F);
     }
 
     volatile ArmGicV2Controller *gicc = g_irqManager.gic.gicc;

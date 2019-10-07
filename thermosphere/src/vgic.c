@@ -89,6 +89,34 @@ static inline u16 vgicGetVirqStateInterruptId(VirqState *cur)
     }
 }
 
+static inline u16 vgicGetVirqStateInterruptId(VirqState *cur)
+{
+    u32 idx = vgicGetVirqStateIndex(cur);
+    /*if (idx == MAX_NUM_INTERRUPTS) {
+        return GIC_IRQID_SPURIOUS;
+    } else*/ if (idx >= 512 - 32) {
+        return (idx - 512 + 32) % 32;
+    } else {
+        return idx;
+    }
+}
+
+static inline u32 vgicGetVirqStateCoreId(VirqState *cur)
+{
+    u32 idx = vgicGetVirqStateIndex(cur);
+    if (vgicGetVirqStateInterruptId(cur) < 32) {
+        return (idx - 512 + 32) / 32;
+    } else {
+        return cur->coreId;
+    }
+}
+
+static inline u32 vgicGetSgiCurrentSourceCoreId(VirqState *cur)
+{
+    return cur->coreId;
+}
+
+
 // Note: ordered by priority
 static void vgicEnqueueVirqState(VirqStateList *list, VirqState *elem)
 {
@@ -265,7 +293,7 @@ static void vgicClearInterruptEnabledState(u16 id)
     // handling the interrupt if it's pending
     VirqState *state = vgicGetVirqState(currentCoreCtx->coreId, id);
     if (state->handled) {
-        vgicNotifyOtherCoreList(BIT(state->coreId));
+        vgicNotifyOtherCoreList(BIT(vgicGetVirqStateCoreId(state)));
     }
 
     g_irqManager.gic.gicd->isenabler[id / 32] &= ~BIT(id % 32);
@@ -357,7 +385,7 @@ static void vgicSetSgiPendingState(u16 id, u32 coreId, u32 srcCoreId)
         // SGI is now pending & possibly needs to be serviced
         VirqState *state = vgicGetVirqState(coreId, id);
         state->pendingLatch = true;
-        state->coreId = coreId;
+        state->coreId = srcCoreId;
         vgicEnqueueVirqState(&g_virqPendingQueue, state);
         vgicNotifyOtherCoreList(BIT(coreId));
     }
@@ -594,14 +622,16 @@ static void vgicCleanupPendingList(void)
     VirqState *node, *next;
     u16 id;
     bool pending;
+    u32 coreId;
 
     for (node = g_virqPendingQueue.first; node != vgicGetQueueEnd(); node = next) {
         next = vgicGetNextQueuedVirqState(node);
 
         // For SGIs, check the pending bits
         id = vgicGetVirqStateInterruptId(node);
+        coreId = vgicGetVirqStateCoreId(node);
         if (id < 16) {
-            pending = g_virqSgiPendingSources[node->coreId][id] != 0;
+            pending = g_virqSgiPendingSources[coreId][id] != 0;
         } else if (!vgicIsVirqEdgeTriggered(id)) {
             // For hardware interrupts, we have kept the interrupt active on the physical GICD
             // For level-sensitive interrupts, we need to check if they're also still physically pending (resampling).
@@ -609,13 +639,15 @@ static void vgicCleanupPendingList(void)
             // we're notified when they become pending again.
 
             // Note: we can't touch PPIs for other cores... but each core will call this function anyway.
-            if (id >= 32 || node->coreId == currentCoreCtx->coreId) {
+            if (id >= 32 || coreId == currentCoreCtx->coreId) {
                 u8 mask = g_irqManager.gic.gicd->ispendr[id / 32] & BIT(id % 32);
                 if (mask == 0) {
                     g_irqManager.gic.gicd->icactiver[id / 32] = mask;
                     pending = false;
                 }
             }
+        } else {
+            pending = node->pendingLatch;
         }
 
         if (!pending) {
@@ -628,10 +660,11 @@ static void vgicCleanupPendingList(void)
 static bool vgicTestInterruptEligibility(VirqState *state)
 {
     u16 id = vgicGetVirqStateInterruptId(state);
+    u32 coreId = vgicGetVirqStateCoreId(node);
 
     // Precondition: state still in list
 
-    if (id < 32 && state->coreId != currentCoreCtx->coreId) {
+    if (id < 32 && coreId != currentCoreCtx->coreId) {
         // We can't handle SGIs/PPIs of other cores.
         return false;
     }
@@ -648,14 +681,102 @@ static u32 vgicChoosePendingInterrupts(size_t *outNumChosen, VirqState *chosen[]
     for (VirqState *node = g_virqPendingQueue.first, *next; node != vgicGetQueueEnd() && *outNumChosen < maxNum; node = next) {
         next = vgicGetNextQueuedVirqState(node);
         if (vgicTestInterruptEligibility(node)) {
+            u16 irqId = vgicGetVirqStateInterruptId(node);
             highestPrio = highestPrio < node->priority ? highestPrio : node->priority;
             node->handled = true;
+            if (irqId < 16) {
+                node->coreId = __builtin_ctz(g_virqSgiPendingSources[vgicGetVirqStateCoreId()][irqId]);
+            }
             vgicDequeueVirqState(&g_virqPendingQueue, node);
             chosen[(*outNumChosen)++] = node;
         }
     }
 
     return highestPrio;
+}
+
+static inline u64 vgicGetElrsrRegister(void)
+{
+    return (u64)g_irqManager.gic.gich->elsr0 | (((u64)g_irqManager.gic.gich->elsr1) << 32);
+}
+
+static inline bool vgicIsListRegisterAvailable(u32 id)
+{
+    return (id >= g_irqManager.numListRegisters) && (vgicGetElrsrRegister() & BITL(id));
+}
+
+static inline size_t vgicGetNumberOfFreeListRegisters(void)
+{
+    return __builtin_popcountll(vgicGetElrsrRegister());
+}
+
+static inline ArmGicV2ListRegister *vgicGetFreeListRegister(void)
+{
+    u32 ff = __builtin_ffsll(vgicGetElrsrRegister());
+    return ff == 0 ? NULL : &g_irqManager.gic.gich->lr[ff - 1];
+}
+
+static void vgicPushListRegisters(VirqState *chosen[], size_t num)
+{
+    for (size_t i = 0; i < num; num++) {
+        VirqState *state = chosen[i];
+        u16 irqId = vgicGetVirqStateInterruptId(state);
+
+        ArmGicV2ListRegister lr = {0};
+        lr.grp1 = false; // group0
+        lr.priority = state->priority;
+        lr.virtualId = irqId;
+
+        // We only add new pending interrupts here...
+        lr.pending = true;
+        lr.active = false;
+
+        // We don't support guests setting the pending latch, so the logic is probably simpler...
+
+        if (irqId < 16) {
+            // SGI
+            // Unset one pennding source temporarily
+            u32 sourceCoreId = vgicGetSgiCurrentSourceCoreId(state);
+            if (g_virqSgiPendingSources[state->coreId][irqId] & ~BIT(sourceCoreId)) {
+                // Multiple sources
+                lr.physicalId = BIT(9) /* EOI notification bit */ | sourceCoreId;
+            } else {
+                lr.physicalId = sourceCoreId;
+            }
+
+            lr.hw = false; // software
+        } else {
+            // Actual physical interrupt
+            lr.hw = true;
+            lr.physicalId = irqId;
+        }
+
+        *vgicGetFreeListRegister() = lr;
+    }
+}
+
+static bool vgicUpdateListRegister(ArmGicV2ListRegister *lr)
+{
+    u16 irqId = lr->virtualId;
+
+    // Update the state
+    VirqState *state = vgicGetVirqState(currentCoreCtx->coreId, irqId);
+    state->active = lr->active;
+    //vgicSetVirqPendingField(state, lr->pending);
+
+    if (lr->active) {
+        // We don't touch active interrupts
+        return false;
+    } else if (lr->pending) {
+        // New interrupts might have come, pending status might have been changed, etc.
+        // We need to put the interrupt back in the pending list (which we clean up afterwards)
+        vgicEnqueueVirqState(g_virqPendingQueue, state);
+        memset(lr, 0, sizeof(lr));
+        return true;
+    } else {
+        memset(lr, 0, sizeof(lr));
+        return false;
+    }
 }
 
 void handleVgicdMmio(ExceptionStackFrame *frame, DataAbortIss dabtIss, size_t offset)
@@ -667,8 +788,8 @@ void handleVgicdMmio(ExceptionStackFrame *frame, DataAbortIss dabtIss, size_t of
     // ipriorityr, itargetsr, *pendsgir are byte-accessible
     if (
         !(offset >= GICDOFF(ipriorityr) && offset < GICDOFF(ipriorityr) + 512) &&
-        !(offset >= GICDOFF(itargetsr)  && offset < GICDOFF(itargetsr) + 512) && 
-        !(offset >= GICDOFF(cpendsgir)  && offset < GICDOFF(cpendsgir) + 16) && 
+        !(offset >= GICDOFF(itargetsr)  && offset < GICDOFF(itargetsr) + 512) &&
+        !(offset >= GICDOFF(cpendsgir)  && offset < GICDOFF(cpendsgir) + 16) &&
         !(offset >= GICDOFF(spendsgir)  && offset < GICDOFF(spendsgir) + 16)
     ) {
         if ((offset & 3) != 0 || sz != 4) {
